@@ -1,0 +1,154 @@
+"""
+Schedule this script as cron to run every day or create a lambda function.
+
+The user should have permissions to create snapshot and delete snapshot.
+
+Script takes backup of selected insatnce ebs volume based on the tag and value suupplied to the function.
+
+
+"""
+
+import boto3
+import collections
+import datetime
+import time
+import re
+
+# Source Region - the region our instances are running in that we're backing up
+source_region = 'us-east-1'
+
+# ec = boto3.client('ec2', region_name=source_region)
+
+ec = boto3.client('ec2')
+sns = boto3.client('sns')
+iam = boto3.client('iam')
+
+
+
+def custom_backup(instance_tag, Value, days):
+    account_ids = ['']  <<< provide the aws account id
+    
+
+    tag = "tag:" + instance_tag
+    values = [Value]
+
+    reservations = ec.describe_instances(
+        Filters=[
+            {'Name': tag, 'Values': values },
+        ]
+    ).get(
+        'Reservations', []
+    )
+
+    instances = sum(
+        [
+            [i for i in r['Instances']]
+            for r in reservations
+        ], [])
+
+    print
+    "Found %d instances that need backing up" % len(instances)
+
+    to_tag = collections.defaultdict(list)
+    copy_tag = collections.defaultdict(list)
+    
+
+    for instance in instances:
+        try:
+            retention_days = [
+                int(t.get('Value')) for t in instance['Tags']
+                if t['Key'] == 'Retention'][0]
+        except IndexError:
+            retention_days = days
+
+        for dev in instance['BlockDeviceMappings']:
+            if dev.get('Ebs', None) is None:
+                continue
+            vol_id = dev['Ebs']['VolumeId']
+            dev_name = dev['DeviceName']
+            print
+            "\tFound EBS volume %s (%s) on instance %s" % (vol_id, dev_name, instance['InstanceId'])
+
+            # figure out instance name if there is one
+            instance_name = ""
+            for tag in instance['Tags']:
+                if tag['Key'] != 'Name':
+                    continue
+                else:
+                    instance_name = tag['Value']
+
+            description = '%s - %s (%s)' % (instance_name, vol_id, dev_name)
+
+            # trigger snapshot
+            snap = ec.create_snapshot(
+                VolumeId=vol_id,
+                Description=description
+            )
+
+            if (snap):
+                print
+                "\t\tSnapshot %s created in %s of [%s]" % (snap['SnapshotId'], source_region, description)
+            to_tag[retention_days].append(snap['SnapshotId'])
+            print
+            "\t\tRetaining snapshot %s of volume %s from instance %s (%s) for %d days" % (
+                snap['SnapshotId'],
+                vol_id,
+                instance['InstanceId'],
+                instance_name,
+                retention_days,
+            )
+
+            time.sleep(1)
+            #addl_ec = boto3.client('ec2', region_name=copy_region)
+            
+
+    import pdb
+    pdb.set_trace()
+    # adding tag to the created snapshot with number of retention days.
+    for retention_days in to_tag.keys():
+        delete_date = datetime.date.today() + datetime.timedelta(days=retention_days)
+        delete_fmt = delete_date.strftime('%Y-%m-%d')
+        print
+        "Will delete %d snapshots on %s" % (len(to_tag[retention_days]), delete_fmt)
+
+        ec.create_tags(
+            Resources=to_tag[retention_days],
+            Tags=[
+                {'Key': 'DeleteOn', 'Value': delete_fmt},
+                {'Key': 'Type', 'Value': 'Automated'},
+            ]
+        )
+
+        
+    # Delete old snapshots
+    # based on the retention day tag added during snapshot creation.
+    delete_on = datetime.date.today().strftime('%Y-%m-%d')
+
+    filters = [
+        {'Name': 'tag:DeleteOn', 'Values': [delete_on]},
+        {'Name': 'tag:Type', 'Values': ['Automated']},
+    ]
+
+    #get all snapshots in account with tag as DeleteOn and value
+    source_snapshot_response = ec.describe_snapshots(OwnerIds=account_ids, Filters=filters)
+
+    for snap in source_snapshot_response['Snapshots']:
+        for tag in snap['Tags']:
+            if tag['Key'] != 'KeepForever':
+                skipping_this_one = False
+                continue
+            else:
+                skipping_this_one = True
+
+        if skipping_this_one == True:
+            print
+            "Skipping snapshot %s (marked KeepForever)" % snap['SnapshotId']
+            # do nothing else
+        else:
+            print
+            "Deleting snapshot %s from %s" % (snap['SnapshotId'], source_region,)
+            ec.delete_snapshot(SnapshotId=snap['SnapshotId'])
+
+
+if __name__ == '__main__':
+    custom_backup('Name','Prod', 70)
